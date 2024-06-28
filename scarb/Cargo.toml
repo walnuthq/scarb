@@ -81,6 +81,7 @@ which.workspace = true
 windows-sys.workspace = true
 zip.workspace = true
 zstd.workspace = true
+cairo-lang-sierra-generator.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 reqwest = { workspace = true, default-features = true}
