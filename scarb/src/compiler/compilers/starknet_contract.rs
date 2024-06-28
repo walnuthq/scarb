@@ -1,11 +1,19 @@
 use anyhow::{bail, ensure, Context, Result};
 use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_defs::ids::NamedLanguageElementId;
-use cairo_lang_filesystem::db::{AsFilesGroupMut, FilesGroup};
+use cairo_lang_diagnostics::ToOption;
+use cairo_lang_filesystem::db::{get_originating_location, AsFilesGroupMut, FilesGroup};
 use cairo_lang_filesystem::flag::Flag;
-use cairo_lang_filesystem::ids::{CrateId, CrateLongId, FlagId};
+use cairo_lang_filesystem::ids::{CrateId, CrateLongId, FileId, FileLongId, FlagId};
+use cairo_lang_filesystem::span::TextSpan;
 use cairo_lang_semantic::db::SemanticGroup;
-use cairo_lang_starknet::compile::compile_prepared_db;
+use cairo_lang_sierra_generator::db::SierraGenGroup;
+use cairo_lang_sierra_generator::program_generator::{
+    SierraProgramDebugInfo, SierraProgramWithDebug,
+};
+use cairo_lang_starknet::compile::{
+    compile_prepared_db, extract_semantic_entrypoints, SemanticEntryPoints,
+};
 use cairo_lang_starknet::contract::{find_contracts, ContractDeclaration};
 use cairo_lang_starknet_classes::allowed_libfuncs::{
     AllowedLibfuncsError, ListSelector, BUILTIN_EXPERIMENTAL_LIBFUNCS_LIST,
@@ -14,12 +22,14 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use cairo_lang_utils::{Upcast, UpcastMut};
 use indoc::{formatdoc, writedoc};
-use itertools::{izip, Itertools};
+use itertools::{chain, izip, Itertools};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fmt::Write;
 use std::iter::zip;
+use std::sync::Arc;
 use tracing::{debug, trace, trace_span};
 
 use crate::compiler::helpers::{build_compiler_config, collect_main_crate_ids, write_json};
@@ -251,6 +261,8 @@ impl Compiler for StarknetContractCompiler {
             compile_prepared_db(db, &contracts, compiler_config)?
         };
 
+        let classes_debug_info = compile_prepared_db_to_debug_info(db, &contracts)?;
+
         check_allowed_libfuncs(&props, &contracts, &classes, db, &unit, ws)?;
 
         let casm_classes: Vec<Option<CasmContractClass>> = if props.casm {
@@ -277,7 +289,9 @@ impl Compiler for StarknetContractCompiler {
         let mut file_stem_calculator = ContractFileStemCalculator::new(contract_paths);
 
         let target_name = &unit.main_component().target_name();
-        for (decl, class, casm_class) in izip!(contracts, classes, casm_classes) {
+        for (decl, class, casm_class, class_debug_info) in
+            izip!(contracts, classes, casm_classes, classes_debug_info)
+        {
             let contract_name = decl.submodule_id.name(db.upcast_mut());
             let contract_path = decl.module_id().full_path(db.upcast_mut());
 
@@ -298,6 +312,17 @@ impl Compiler for StarknetContractCompiler {
                 let file_name = format!("{file_stem}.contract_class.json");
                 write_json(&file_name, "output file", &target_dir, ws, &class)?;
                 artifact.artifacts.sierra = Some(file_name);
+
+                let sierra_to_cairo_debug_info =
+                    get_sierra_to_cairo_debug_info(&class_debug_info, &db);
+                let file_name = format!("{file_stem}.contract_class_debug.json");
+                write_json(
+                    &file_name,
+                    "output file",
+                    &target_dir,
+                    ws,
+                    &sierra_to_cairo_debug_info,
+                )?;
             }
 
             // if props.casm
@@ -496,4 +521,223 @@ fn check_allowed_libfuncs(
     }
 
     Ok(())
+}
+
+pub fn compile_prepared_db_to_debug_info(
+    db: &RootDatabase,
+    contracts: &[&ContractDeclaration],
+    // mut compiler_config: CompilerConfig<'_>,
+) -> Result<Vec<SierraProgramDebugInfo>> {
+    // compiler_config.diagnostics_reporter.ensure(db)?;
+
+    contracts
+        .iter()
+        .map(|contract| compile_contract_with_prepared_and_checked_db_to_debug_info(db, contract))
+        .try_collect()
+}
+
+/// Compile declared Starknet contract.
+///
+/// The `contract` value **must** come from `db`, for example as a result of calling
+/// [`find_contracts`]. Does not check diagnostics, it is expected that they are checked by caller
+/// of this function.
+fn compile_contract_with_prepared_and_checked_db_to_debug_info(
+    db: &RootDatabase,
+    contract: &ContractDeclaration,
+) -> Result<SierraProgramDebugInfo> {
+    let SemanticEntryPoints {
+        external,
+        l1_handler,
+        constructor,
+    } = extract_semantic_entrypoints(db, contract)?;
+    let SierraProgramWithDebug {
+        program: mut sierra_program,
+        debug_info,
+    } = Arc::unwrap_or_clone(
+        db.get_sierra_program_for_functions(
+            chain!(&external, &l1_handler, &constructor)
+                .map(|f| f.value)
+                .collect(),
+        )
+        .to_option()
+        .with_context(|| "Compilation failed without any diagnostics.")?,
+    );
+
+    Ok(debug_info)
+
+    // if compiler_config.replace_ids {
+    //     sierra_program = replace_sierra_ids_in_program(db, &sierra_program);
+    // }
+    // let replacer = CanonicalReplacer::from_program(&sierra_program);
+    // let sierra_program = replacer.apply(&sierra_program);
+
+    // // let entry_points_by_type = ContractEntryPoints {
+    // //     external: get_entry_points(db, &external, &replacer)?,
+    // //     l1_handler: get_entry_points(db, &l1_handler, &replacer)?,
+    // //     // Later generation of ABI verifies that there is up to one constructor.
+    // //     constructor: get_entry_points(db, &constructor, &replacer)?,
+    // // };
+
+    // let annotations = if compiler_config.add_statements_functions {
+    //     let statements_functions = debug_info
+    //         .statements_locations
+    //         .extract_statements_functions(db);
+    //     Annotations::from(statements_functions)
+    // } else {
+    //     Default::default()
+    // };
+
+    // let contract_class = ContractClass::new(
+    //     &sierra_program,
+    //     entry_points_by_type,
+    //     Some(
+    //         AbiBuilder::from_submodule(db, contract.submodule_id, Default::default())
+    //             .ok()
+    //             .with_context(|| "Unexpected error while generating ABI.")?
+    //             .finalize()
+    //             .with_context(|| "Could not create ABI from contract submodule")?,
+    //     ),
+    //     annotations,
+    // )?;
+    // contract_class.sanity_check();
+    // Ok(contract_class)
+}
+
+// /// Returns the entry points given their IDs sorted by selectors.
+// fn get_entry_points(
+//     db: &RootDatabase,
+//     entry_point_functions: &[Aliased<ConcreteFunctionWithBodyId>],
+//     replacer: &CanonicalReplacer,
+// ) -> Result<Vec<ContractEntryPoint>> {
+//     let mut entry_points = vec![];
+//     for function_with_body_id in entry_point_functions {
+//         let (selector, sierra_id) =
+//             get_selector_and_sierra_function(db, function_with_body_id, replacer);
+
+//         entry_points.push(ContractEntryPoint {
+//             selector: selector.to_biguint(),
+//             function_idx: sierra_id.id as usize,
+//         });
+//     }
+//     entry_points.sort_by(|a, b| a.selector.cmp(&b.selector));
+//     Ok(entry_points)
+// }
+
+#[derive(Debug, Serialize)]
+pub struct SierraToCairoDebugInfo {
+    pub sierra_statements_to_cairo_info: HashMap<usize, SierraStatementToCairoDebugInfo>,
+}
+
+/// Human readable position inside a file, in lines and characters.
+#[derive(Debug, Serialize, Clone)]
+pub struct TextPosition {
+    /// Line index, 0 based.
+    pub line: usize,
+    /// Character index inside the line, 0 based.
+    pub col: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Location {
+    pub start: TextPosition,
+    pub end: TextPosition,
+    pub file_path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SierraStatementToCairoDebugInfo {
+    pub cairo_locations: Vec<Location>,
+}
+
+/// Returns a map from Sierra statement indexes to Cairo function names.
+pub fn get_sierra_to_cairo_debug_info(
+    sierra_program_debug_info: &SierraProgramDebugInfo,
+    compiler_db: &RootDatabase,
+) -> SierraToCairoDebugInfo {
+    let mut sierra_statements_to_cairo_info: HashMap<usize, SierraStatementToCairoDebugInfo> =
+        HashMap::new();
+
+    for (statement_idx, locations) in sierra_program_debug_info
+        .statements_locations
+        .locations
+        .iter_sorted()
+    {
+        let mut cairo_locations: Vec<Location> = Vec::new();
+        for location in locations {
+            let syntax_node = location.syntax_node(compiler_db);
+            let file_id = syntax_node.stable_ptr().file_id(compiler_db);
+            let file_name = file_id.file_name(compiler_db);
+            let syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
+
+            let (originating_file_id, originating_text_span) =
+                get_originating_location(compiler_db, file_id, syntax_node_location_span);
+            let cairo_location = get_location_from_text_span(
+                originating_text_span,
+                originating_file_id,
+                compiler_db,
+            );
+            if cairo_location.is_some() {
+                cairo_locations.push(cairo_location.unwrap());
+            }
+        }
+        sierra_statements_to_cairo_info.insert(
+            statement_idx.0,
+            SierraStatementToCairoDebugInfo { cairo_locations },
+        );
+    }
+
+    SierraToCairoDebugInfo {
+        sierra_statements_to_cairo_info,
+    }
+}
+
+pub fn get_location_from_text_span(
+    text_span: TextSpan,
+    file_id: FileId,
+    compiler_db: &RootDatabase,
+) -> Option<Location> {
+    let current_dir = env::current_dir().expect("Failed to get current directory");
+    dbg!(&current_dir);
+    // let file_path = match compiler_db.lookup_intern_file(file_id) {
+    //     FileLongId::OnDisk(path) => {
+    //         path.strip_prefix(current_dir).expect("Failed to get relative path").to_path_buf().to_str().unwrap_or("<unknown>").to_string()
+    //     },
+    //     FileLongId::Virtual(_) => file_id.full_path(compiler_db),
+    // };
+    let file_path = match compiler_db.lookup_intern_file(file_id) {
+        FileLongId::OnDisk(path) => match path.strip_prefix(&current_dir) {
+            Ok(relative_path) => relative_path.to_str().unwrap_or("<unknown>").to_string(),
+            Err(_) => {
+                return None;
+            }
+        },
+        FileLongId::Virtual(_) => {
+            return None;
+        }
+    };
+
+    // let file_path = file_id.full_path(compiler_db);
+
+    let start: Option<TextPosition> =
+        text_span
+            .start
+            .position_in_file(compiler_db, file_id)
+            .map(|s| TextPosition {
+                line: s.line,
+                col: s.col,
+            });
+
+    let end = text_span
+        .end
+        .position_in_file(compiler_db, file_id)
+        .map(|e| TextPosition {
+            line: e.line,
+            col: e.col,
+        });
+
+    start.zip(end).map(|(start, end)| Location {
+        start,
+        end,
+        file_path,
+    })
 }
