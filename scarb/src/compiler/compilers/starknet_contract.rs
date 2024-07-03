@@ -4,7 +4,7 @@ use cairo_lang_defs::ids::NamedLanguageElementId;
 use cairo_lang_diagnostics::ToOption;
 use cairo_lang_filesystem::db::{get_originating_location, AsFilesGroupMut, FilesGroup};
 use cairo_lang_filesystem::flag::Flag;
-use cairo_lang_filesystem::ids::{CrateId, CrateLongId, FileId, FileLongId, FlagId};
+use cairo_lang_filesystem::ids::{CrateId, CrateLongId, FileId, FileLongId, FlagId, VirtualFile};
 use cairo_lang_filesystem::span::TextSpan;
 use cairo_lang_semantic::db::SemanticGroup;
 use cairo_lang_sierra_generator::db::SierraGenGroup;
@@ -630,29 +630,48 @@ pub fn get_sierra_to_cairo_debug_info(
     let mut sierra_statements_to_cairo_info: HashMap<usize, SierraStatementToCairoDebugInfo> =
         HashMap::new();
 
-    for (statement_idx, locations) in sierra_program_debug_info
+    for (statement_idx, location) in sierra_program_debug_info
         .statements_locations
         .locations
         .iter_sorted()
     {
         let mut cairo_locations: Vec<Location> = Vec::new();
-        for location in locations {
-            let syntax_node = location.syntax_node(compiler_db);
-            let file_id = syntax_node.stable_ptr().file_id(compiler_db);
-            let file_name = file_id.file_name(compiler_db);
-            let syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
+        // for location in locations {
+        let syntax_node = location.syntax_node(compiler_db);
+        let file_id = syntax_node.stable_ptr().file_id(compiler_db);
+        let file_name = file_id.file_name(compiler_db);
+        let syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
 
-            let (originating_file_id, originating_text_span) =
-                get_originating_location(compiler_db, file_id, syntax_node_location_span);
-            let cairo_location = get_location_from_text_span(
-                originating_text_span,
-                originating_file_id,
-                compiler_db,
-            );
-            if cairo_location.is_some() {
-                cairo_locations.push(cairo_location.unwrap());
+        // let (originating_file_id, originating_text_span) =
+        //     get_originating_location(compiler_db, file_id, syntax_node_location_span);
+
+        while let FileLongId::Virtual(VirtualFile {
+            parent: Some(parent),
+            code_mappings,
+            ..
+        }) = compiler_db.lookup_intern_file(file_id)
+        {
+            if let Some(origin) = code_mappings
+                .iter()
+                .find_map(|mapping| mapping.translate(syntax_node_location_span))
+            {
+                // span = origin;
+                // file_id = parent;
+                let cairo_location = get_location_from_text_span(origin, parent, compiler_db);
+                if cairo_location.is_some() {
+                    cairo_locations.push(cairo_location.unwrap());
+                }
+            } else {
+                break;
             }
         }
+
+        // let cairo_location =
+        //     get_location_from_text_span(originating_text_span, originating_file_id, compiler_db);
+        // if cairo_location.is_some() {
+        //     cairo_locations.push(cairo_location.unwrap());
+        // }
+        // }
         sierra_statements_to_cairo_info.insert(
             statement_idx.0,
             SierraStatementToCairoDebugInfo { cairo_locations },
