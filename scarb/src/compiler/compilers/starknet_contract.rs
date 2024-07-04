@@ -689,7 +689,7 @@ pub fn get_location_from_text_span(
     compiler_db: &RootDatabase,
 ) -> Option<Location> {
     let current_dir = env::current_dir().expect("Failed to get current directory");
-    dbg!(&current_dir);
+    // dbg!(&current_dir);
     // let file_path = match compiler_db.lookup_intern_file(file_id) {
     //     FileLongId::OnDisk(path) => {
     //         path.strip_prefix(current_dir).expect("Failed to get relative path").to_path_buf().to_str().unwrap_or("<unknown>").to_string()
