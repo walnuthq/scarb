@@ -643,8 +643,13 @@ pub fn get_sierra_to_cairo_debug_info(
         let mut syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
 
         // let (originating_file_id, originating_text_span) =
-        get_originating_location(compiler_db, file_id, syntax_node_location_span);
+        // get_originating_location(compiler_db, file_id, syntax_node_location_span);
 
+        let cairo_location =
+            get_location_from_text_span(syntax_node_location_span, file_id, compiler_db);
+        if cairo_location.is_some() {
+            cairo_locations.push(cairo_location.unwrap());
+        }
         while let FileLongId::Virtual(VirtualFile {
             parent: Some(parent),
             code_mappings,
@@ -657,7 +662,8 @@ pub fn get_sierra_to_cairo_debug_info(
             {
                 syntax_node_location_span = origin;
                 file_id = parent;
-                let cairo_location = get_location_from_text_span(origin, parent, compiler_db);
+                let cairo_location =
+                    get_location_from_text_span(syntax_node_location_span, file_id, compiler_db);
                 if cairo_location.is_some() {
                     cairo_locations.push(cairo_location.unwrap());
                 }
