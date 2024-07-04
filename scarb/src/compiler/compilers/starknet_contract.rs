@@ -638,12 +638,12 @@ pub fn get_sierra_to_cairo_debug_info(
         let mut cairo_locations: Vec<Location> = Vec::new();
         // for location in locations {
         let syntax_node = location.syntax_node(compiler_db);
-        let file_id = syntax_node.stable_ptr().file_id(compiler_db);
+        let mut file_id = syntax_node.stable_ptr().file_id(compiler_db);
         let file_name = file_id.file_name(compiler_db);
-        let syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
+        let mut syntax_node_location_span = syntax_node.span_without_trivia(compiler_db);
 
         // let (originating_file_id, originating_text_span) =
-        //     get_originating_location(compiler_db, file_id, syntax_node_location_span);
+        get_originating_location(compiler_db, file_id, syntax_node_location_span);
 
         while let FileLongId::Virtual(VirtualFile {
             parent: Some(parent),
@@ -655,8 +655,8 @@ pub fn get_sierra_to_cairo_debug_info(
                 .iter()
                 .find_map(|mapping| mapping.translate(syntax_node_location_span))
             {
-                // span = origin;
-                // file_id = parent;
+                syntax_node_location_span = origin;
+                file_id = parent;
                 let cairo_location = get_location_from_text_span(origin, parent, compiler_db);
                 if cairo_location.is_some() {
                     cairo_locations.push(cairo_location.unwrap());
